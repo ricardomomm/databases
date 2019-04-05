@@ -103,7 +103,7 @@ def async_adapter(wrapped_func):
 async def test_queries(database_url):
     """
     Test that the basic `execute()`, `execute_many()`, `fetch_all()``, and
-    `fetch_one()` interfaces are all supported.
+    `fetch_one()` interfaces are all supported (using SQLAlchemy core).
     """
     async with Database(database_url) as database:
         async with database.transaction(force_rollback=True):
@@ -137,8 +137,64 @@ async def test_queries(database_url):
             assert result["text"] == "example1"
             assert result["completed"] == True
 
+            # fetch_val()
+            query = sqlalchemy.sql.select([notes.c.text])
+            result = await database.fetch_val(query=query)
+            assert result == "example1"
+
             # iterate()
             query = notes.select()
+            iterate_results = []
+            async for result in database.iterate(query=query):
+                iterate_results.append(result)
+            assert len(iterate_results) == 3
+            assert iterate_results[0]["text"] == "example1"
+            assert iterate_results[0]["completed"] == True
+            assert iterate_results[1]["text"] == "example2"
+            assert iterate_results[1]["completed"] == False
+            assert iterate_results[2]["text"] == "example3"
+            assert iterate_results[2]["completed"] == True
+
+
+@pytest.mark.parametrize("database_url", DATABASE_URLS)
+@async_adapter
+async def test_queries_raw(database_url):
+    """
+    Test that the basic `execute()`, `execute_many()`, `fetch_all()``, and
+    `fetch_one()` interfaces are all supported (raw queries).
+    """
+    async with Database(database_url) as database:
+        async with database.transaction(force_rollback=True):
+            # execute()
+            query = "INSERT INTO notes(text, completed) VALUES (:text, :completed)"
+            values = {"text": "example1", "completed": True}
+            await database.execute(query, values)
+
+            # execute_many()
+            query = "INSERT INTO notes(text, completed) VALUES (:text, :completed)"
+            values = [
+                {"text": "example2", "completed": False},
+                {"text": "example3", "completed": True},
+            ]
+            await database.execute_many(query, values)
+
+            # fetch_all()
+            query = "SELECT * FROM notes WHERE completed = :completed"
+            results = await database.fetch_all(query=query, values={"completed": True})
+            assert len(results) == 2
+            assert results[0]["text"] == "example1"
+            assert results[0]["completed"] == True
+            assert results[1]["text"] == "example3"
+            assert results[1]["completed"] == True
+
+            # fetch_one()
+            query = "SELECT * FROM notes WHERE completed = :completed"
+            result = await database.fetch_one(query=query, values={"completed": False})
+            assert result["text"] == "example2"
+            assert result["completed"] == False
+
+            # iterate()
+            query = "SELECT * FROM notes"
             iterate_results = []
             async for result in database.iterate(query=query):
                 iterate_results.append(result)
@@ -180,6 +236,37 @@ async def test_results_support_mapping_interface(database_url):
 
 @pytest.mark.parametrize("database_url", DATABASE_URLS)
 @async_adapter
+async def test_results_support_column_reference(database_url):
+    """
+    Casting results to a dict should work, since the interface defines them
+    as supporting the mapping interface.
+    """
+    async with Database(database_url) as database:
+        async with database.transaction(force_rollback=True):
+            now = datetime.datetime.now().replace(microsecond=0)
+            today = datetime.date.today()
+
+            # execute()
+            query = articles.insert()
+            values = {"title": "Hello, world Article", "published": now}
+            await database.execute(query, values)
+
+            query = custom_date.insert()
+            values = {"title": "Hello, world Custom", "published": today}
+            await database.execute(query, values)
+
+            # fetch_all()
+            query = sqlalchemy.select([articles, custom_date])
+            results = await database.fetch_all(query=query)
+            assert len(results) == 1
+            assert results[0][articles.c.title] == "Hello, world Article"
+            assert results[0][articles.c.published] == now
+            assert results[0][custom_date.c.title] == "Hello, world Custom"
+            assert results[0][custom_date.c.published] == today
+
+
+@pytest.mark.parametrize("database_url", DATABASE_URLS)
+@async_adapter
 async def test_fetch_one_returning_no_results(database_url):
     """
     fetch_one should return `None` when no results match.
@@ -203,8 +290,8 @@ async def test_execute_return_val(database_url):
             query = notes.insert()
             values = {"text": "example1", "completed": True}
             pk = await database.execute(query, values)
-
             assert isinstance(pk, int)
+
             query = notes.select().where(notes.c.id == pk)
             result = await database.fetch_one(query)
             assert result["text"] == "example1"
@@ -514,3 +601,101 @@ async def test_connection_context(database_url):
         test_complete.set()
         await task_1
         await task_2
+
+
+@pytest.mark.parametrize("database_url", DATABASE_URLS)
+@async_adapter
+async def test_connection_context_with_raw_connection(database_url):
+    """
+    Test connection contexts with respect to the raw connection.
+    """
+    async with Database(database_url) as database:
+        async with database.connection() as connection_1:
+            async with database.connection() as connection_2:
+                assert connection_1 is connection_2
+                assert connection_1.raw_connection is connection_2.raw_connection
+
+
+@pytest.mark.parametrize("database_url", DATABASE_URLS)
+@async_adapter
+async def test_queries_with_expose_backend_connection(database_url):
+    """
+    Replication of `execute()`, `execute_many()`, `fetch_all()``, and
+    `fetch_one()` using the raw driver interface.
+    """
+    async with Database(database_url) as database:
+        async with database.connection() as connection:
+            async with database.transaction(force_rollback=True):
+                # Get the raw connection
+                raw_connection = connection.raw_connection
+
+                # Insert query
+                if str(database_url).startswith("mysql"):
+                    insert_query = "INSERT INTO notes (text, completed) VALUES (%s, %s)"
+                else:
+                    insert_query = "INSERT INTO notes (text, completed) VALUES ($1, $2)"
+
+                # execute()
+                values = ("example1", True)
+
+                if str(database_url).startswith("postgresql"):
+                    await raw_connection.execute(insert_query, *values)
+                elif str(database_url).startswith("mysql"):
+                    cursor = await raw_connection.cursor()
+                    await cursor.execute(insert_query, values)
+                elif str(database_url).startswith("sqlite"):
+                    await raw_connection.execute(insert_query, values)
+
+                # execute_many()
+                values = [("example2", False), ("example3", True)]
+
+                if str(database_url).startswith("mysql"):
+                    cursor = await raw_connection.cursor()
+                    await cursor.executemany(insert_query, values)
+                else:
+                    await raw_connection.executemany(insert_query, values)
+
+                # Select query
+                select_query = "SELECT notes.id, notes.text, notes.completed FROM notes"
+
+                # fetch_all()
+                if str(database_url).startswith("postgresql"):
+                    results = await raw_connection.fetch(select_query)
+                elif str(database_url).startswith("mysql"):
+                    cursor = await raw_connection.cursor()
+                    await cursor.execute(select_query)
+                    results = await cursor.fetchall()
+                elif str(database_url).startswith("sqlite"):
+                    results = await raw_connection.execute_fetchall(select_query)
+
+                assert len(results) == 3
+                # Raw output for the raw request
+                assert results[0][1] == "example1"
+                assert results[0][2] == True
+                assert results[1][1] == "example2"
+                assert results[1][2] == False
+                assert results[2][1] == "example3"
+                assert results[2][2] == True
+
+                # fetch_one()
+                if str(database_url).startswith("postgresql"):
+                    result = await raw_connection.fetchrow(select_query)
+                else:
+                    cursor = await raw_connection.cursor()
+                    await cursor.execute(select_query)
+                    result = await cursor.fetchone()
+
+                # Raw output for the raw request
+                assert result[1] == "example1"
+                assert result[2] == True
+
+
+@pytest.mark.parametrize("database_url", DATABASE_URLS)
+@async_adapter
+async def test_database_url_interface(database_url):
+    """
+    Test that Database instances expose a `.url` attribute.
+    """
+    async with Database(database_url) as database:
+        assert isinstance(database.url, DatabaseURL)
+        assert database.url == database_url

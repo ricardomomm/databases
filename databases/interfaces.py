@@ -27,10 +27,10 @@ class ConnectionBackend:
     async def fetch_one(self, query: ClauseElement) -> typing.Optional[typing.Mapping]:
         raise NotImplementedError()  # pragma: no cover
 
-    async def execute(self, query: ClauseElement, values: dict = None) -> typing.Any:
+    async def execute(self, query: ClauseElement) -> typing.Any:
         raise NotImplementedError()  # pragma: no cover
 
-    async def execute_many(self, query: ClauseElement, values: list) -> None:
+    async def execute_many(self, queries: typing.List[ClauseElement]) -> None:
         raise NotImplementedError()  # pragma: no cover
 
     async def iterate(
@@ -42,6 +42,10 @@ class ConnectionBackend:
         yield True  # pragma: no cover
 
     def transaction(self) -> "TransactionBackend":
+        raise NotImplementedError()  # pragma: no cover
+
+    @property
+    def raw_connection(self) -> typing.Any:
         raise NotImplementedError()  # pragma: no cover
 
 

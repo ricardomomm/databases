@@ -6,6 +6,8 @@ import asyncpg
 from sqlalchemy.dialects.postgresql import pypostgresql
 from sqlalchemy.engine.interfaces import Dialect
 from sqlalchemy.sql import ClauseElement
+from sqlalchemy.sql.schema import Column
+from sqlalchemy.types import TypeEngine
 
 from databases.core import DatabaseURL
 from databases.interfaces import ConnectionBackend, DatabaseBackend, TransactionBackend
@@ -65,17 +67,35 @@ class PostgresBackend(DatabaseBackend):
 
 
 class Record(Mapping):
-    def __init__(self, row: tuple, result_columns: tuple, dialect: Dialect) -> None:
+    def __init__(
+        self, row: asyncpg.Record, result_columns: tuple, dialect: Dialect
+    ) -> None:
         self._row = row
         self._result_columns = result_columns
         self._dialect = dialect
-        self._column_map = {
-            column_name: (idx, datatype)
-            for idx, (column_name, _, _, datatype) in enumerate(self._result_columns)
-        }
+        self._column_map = (
+            {}
+        )  # type: typing.Mapping[str, typing.Tuple[int, TypeEngine]]
+        self._column_map_int = (
+            {}
+        )  # type: typing.Mapping[int, typing.Tuple[int, TypeEngine]]
+        self._column_map_full = (
+            {}
+        )  # type: typing.Mapping[str, typing.Tuple[int, TypeEngine]]
+        for idx, (column_name, _, column, datatype) in enumerate(self._result_columns):
+            self._column_map[column_name] = (idx, datatype)
+            self._column_map_int[idx] = (idx, datatype)
+            self._column_map_full[str(column[0])] = (idx, datatype)
 
-    def __getitem__(self, key: str) -> typing.Any:
-        idx, datatype = self._column_map[key]
+    def __getitem__(self, key: typing.Any) -> typing.Any:
+        if len(self._column_map) == 0:  # raw query
+            return self._row[tuple(self._row.keys()).index(key)]
+        elif type(key) is Column:
+            idx, datatype = self._column_map_full[str(key)]
+        elif type(key) is int:
+            idx, datatype = self._column_map_int[key]
+        else:
+            idx, datatype = self._column_map[key]
         raw = self._row[idx]
         try:
             processor = _result_processors[datatype]
@@ -125,20 +145,17 @@ class PostgresConnection(ConnectionBackend):
             return None
         return Record(row, result_columns, self._dialect)
 
-    async def execute(self, query: ClauseElement, values: dict = None) -> typing.Any:
+    async def execute(self, query: ClauseElement) -> typing.Any:
         assert self._connection is not None, "Connection is not acquired"
-        if values is not None:
-            query = query.values(values)
         query, args, result_columns = self._compile(query)
         return await self._connection.fetchval(query, *args)
 
-    async def execute_many(self, query: ClauseElement, values: list) -> None:
+    async def execute_many(self, queries: typing.List[ClauseElement]) -> None:
         assert self._connection is not None, "Connection is not acquired"
         # asyncpg uses prepared statements under the hood, so we just
         # loop through multiple executes here, which should all end up
         # using the same prepared statement.
-        for item in values:
-            single_query = query.values(item)
+        for single_query in queries:
             single_query, args, result_columns = self._compile(single_query)
             await self._connection.execute(single_query, *args)
 
@@ -170,6 +187,11 @@ class PostgresConnection(ConnectionBackend):
 
         logger.debug("Query: %s\nArgs: %s", compiled_query, args)
         return compiled_query, args, compiled._result_columns
+
+    @property
+    def raw_connection(self) -> asyncpg.connection.Connection:
+        assert self._connection is not None, "Connection is not acquired"
+        return self._connection
 
 
 class PostgresTransaction(TransactionBackend):
